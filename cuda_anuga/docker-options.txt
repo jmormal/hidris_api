@@ -1,0 +1,13 @@
+# Build the viewer image (one-time, extends your existing anuga-gpu)
+docker compose build viewer
+
+# Run simulations (same as before)
+docker compose run anuga python /code/dam_break_benchmark.py --run mpi,gpu
+
+# View results — need X11 forwarding on host first:
+xhost +local:docker
+docker compose run viewer anuga_viewer /output/myrun.sww
+
+# Interactive shell with viewer available
+docker compose run viewer bash
+# then: anuga_viewer /output/some_file.sww

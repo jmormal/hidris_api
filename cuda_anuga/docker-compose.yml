@@ -1,0 +1,31 @@
+services:
+  anuga:
+    image: anuga-gpu
+    runtime: nvidia
+    container_name: anuga_cuda_final
+    shm_size: '2g'
+    volumes:
+      - .:/code
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    tty: true
+    stdin_open: true
+
+  viewer:
+    build:
+      context: .
+      dockerfile: Dockerfile.viewer
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - .:/code
+      - ./models:/models
+      - ./output:/output
+    working_dir: /output
+    stdin_open: true
+    tty: true

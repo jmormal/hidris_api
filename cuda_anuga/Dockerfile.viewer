@@ -1,0 +1,23 @@
+FROM anuga-gpu
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Viewer build dependencies + OpenGL/X11 runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  build-essential git \
+  libgdal-dev libcppunit-dev libopenscenegraph-dev \
+  libgl1-mesa-glx libgl1-mesa-dri mesa-utils \
+  x11-apps \
+  && rm -rf /var/lib/apt/lists/*
+
+# Build anuga-viewer from source
+RUN git clone --depth 1 https://github.com/anuga-community/anuga-viewer.git \
+  /opt/anuga-viewer \
+  && cd /opt/anuga-viewer \
+  && make \
+  && make install
+
+ENV SWOLLEN_BINDIR=/opt/anuga-viewer/bin
+ENV PATH="${PATH}:${SWOLLEN_BINDIR}"
+
+CMD ["/bin/bash"]
