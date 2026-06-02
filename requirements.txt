@@ -15,5 +15,8 @@ triangle>=20230923
 tqdm
 pymetis
 mpi4py
+redis
 fastapi
+pydantic
+rq
 uvicorn[standard]
