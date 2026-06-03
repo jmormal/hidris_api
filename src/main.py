@@ -69,7 +69,7 @@ class JobsByStateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-REDIS_QUEUE = os.getenv("REDIS_CPU", "jobs:cpu")
+REDIS_QUEUE = os.getenv("REDIS_CPU", "jobs:gpu")
 
 redis_conn = Redis.from_url(REDIS_URL)
 q = Queue(REDIS_QUEUE, connection=redis_conn)
@@ -269,7 +269,7 @@ async def stream_job(job_id: str):
 @app.get("/api/simulate/{job_id}/result", tags=["Model"])
 async def get_result(job_id: str):
     job = _fetch_job(job_id)
-    await asyncio.sleep(2.5)  # Wait briefly for persistence
+    await asyncio.sleep(5.5)  # Wait briefly for persistence
     print(job)
 
     if job.get_status() == JobStatus.FINISHED and job.result is None:
