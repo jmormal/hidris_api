@@ -17,7 +17,7 @@ import os
 import json
 import asyncio
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
@@ -280,4 +280,8 @@ async def get_result(job_id: str):
     result = job.result
     if result is None:
         raise HTTPException(status_code=404, detail="No result available")
-    return JSONResponse(content=result)
+    return Response(
+        content=result,
+        media_type="application/json",
+        headers={"Content-Encoding": "gzip"},
+    )
