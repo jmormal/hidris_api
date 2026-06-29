@@ -7,13 +7,15 @@ Requires a running Redis and at least one RQ worker:
     rq worker jobs:cpu --url redis://localhost:6379
 
 Auth: tokens are issued by Keycloak (realm: hidris). This API only validates
-them. In Swagger, use the "Authorize" button -> it runs the Authorization
-Code + PKCE flow against Keycloak; log in as test/test.
+them. The SSE stream takes the token as ?access_token= because EventSource
+cannot send an Authorization header.
 """
 
 import os
 import json
 import asyncio
+
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +35,7 @@ from rq.registry import (
 from pydantic import BaseModel, Field
 from typing import Any, List, Optional
 
-from src.auth import current_user, CLIENT_ID
+from src.auth import current_user, current_user_from_query, CLIENT_ID
 import src.db as db
 from src.events import channel_for, decode
 
@@ -46,6 +48,13 @@ from src.events import channel_for, decode
 class InstanceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: Optional[str] = None
+
+
+class InstanceUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=255)
+    description: Optional[str] = None
+    # serialized setup payload (features + config)
+    instance: Optional[dict] = None
 
 
 class EnqueueResponse(BaseModel):
@@ -102,8 +111,14 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def _startup():
+    # Idempotent; ensures the table exists before the first request.
+    db.init_db()
+
+
 # ---------------------------------------------------------------------------
-# Auth-related convenience endpoint
+# Auth / health
 # ---------------------------------------------------------------------------
 
 
@@ -141,34 +156,69 @@ def _fetch_job(job_id: str) -> Job:
 
 
 # ---------------------------------------------------------------------------
-# Instances of the user
+# Instances (CRUD)
 # ---------------------------------------------------------------------------
 
 
 @app.get("/api/instances", tags=["Model"])
-async def get_instances(user=Depends(current_user)):
-    return db.get_instances(user["sub"])
+async def list_instances(user=Depends(current_user)):
+    return db.list_instances(user["sub"])
 
 
-@app.post("/api/instance", tags=["Model"], status_code=201)
-async def post_instance(payload: InstanceCreate, user=Depends(current_user)):
-    return db.create_instance(
-        user_id=user["sub"],
+@app.post("/api/instances", tags=["Model"], status_code=201)
+async def create_instance(payload: InstanceCreate, user=Depends(current_user)):
+    return db.create_instance(user["sub"], payload.name, payload.description)
+
+
+@app.get("/api/instances/{public_id}", tags=["Model"])
+async def get_instance(public_id: UUID, user=Depends(current_user)):
+    row = db.get_instance(user["sub"], str(public_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    return row
+
+
+@app.patch("/api/instances/{public_id}", tags=["Model"])
+async def update_instance(
+    public_id: UUID, payload: InstanceUpdate, user=Depends(current_user)
+):
+    row = db.update_instance(
+        user["sub"],
+        str(public_id),
         name=payload.name,
         description=payload.description,
+        instance=payload.instance,
     )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    return row
+
+
+@app.delete("/api/instances/{public_id}", tags=["Model"], status_code=204)
+async def delete_instance(public_id: UUID, user=Depends(current_user)):
+    if not db.delete_instance(user["sub"], str(public_id)):
+        raise HTTPException(status_code=404, detail="Instance not found")
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
-# Submit -> enqueue
+# Submit -> enqueue (per instance)
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/simulate", response_model=EnqueueResponse, tags=["Model"])
-async def submit_simulation(payload: dict, user=Depends(current_user)):
+@app.post(
+    "/api/instances/{public_id}/simulate",
+    response_model=EnqueueResponse,
+    tags=["Model"],
+)
+async def submit_simulation(public_id: UUID, user=Depends(current_user)):
+    inst = db.get_instance(user["sub"], str(public_id))
+    if inst is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
     job = q.enqueue(
         "tasks.run_anuga",
-        payload,
+        {"public_id": str(public_id), "payload": inst["instance"]},
         job_timeout=JOB_TIMEOUT,
         result_ttl=RESULT_TTL,
         meta={"progress": 0.0, "status_message": "Queued"},
@@ -177,7 +227,7 @@ async def submit_simulation(payload: dict, user=Depends(current_user)):
 
 
 @app.get("/job-status/{job_id}", response_model=JobStatusResponse, tags=["Model"])
-async def get_job_status(job_id: str):
+async def get_job_status(job_id: str, user=Depends(current_user)):
     """Single-shot status check (the SSE stream is the live path)."""
     job = _fetch_job(job_id)
     status = job.get_status()
@@ -191,7 +241,7 @@ async def get_job_status(job_id: str):
             "status": status,
             "progress": 100,
             "status_message": "Complete",
-            "result": job.result,
+            "result": None,
         }
     if status == JobStatus.FAILED:
         return {
@@ -212,6 +262,7 @@ async def get_job_status(job_id: str):
 
 # ---------------------------------------------------------------------------
 # SSE stream <- Redis pub/sub (push, not poll)
+# Auth via ?access_token= because EventSource can't set headers.
 # ---------------------------------------------------------------------------
 
 
@@ -220,17 +271,10 @@ def _sse(event: str, data: dict) -> str:
 
 
 @app.get("/api/simulate/{job_id}/stream", tags=["Model"])
-async def stream_job(job_id: str):
-    """
-    Subscribe to the job's Redis channel and forward each published message
-    to the client as an SSE event. redis-py pubsub is blocking/sync, so we
-    run get_message in a thread and bridge into asyncio via a queue.
-    """
+async def stream_job(job_id: str, user=Depends(current_user_from_query)):
     job = _fetch_job(job_id)  # 404 fast on bad id
     channel = channel_for(job_id)
 
-    # Subscribe BEFORE checking terminal state to avoid a race where the job
-    # finishes between our status check and our subscription.
     pubsub = redis_conn.pubsub(ignore_subscribe_messages=True)
     pubsub.subscribe(channel)
 
@@ -239,7 +283,6 @@ async def stream_job(job_id: str):
     stop = asyncio.Event()
 
     def reader():
-        # Runs in a worker thread; blocks on Redis, pushes into the asyncio queue.
         while not stop.is_set():
             msg = pubsub.get_message(timeout=1.0)
             if msg and msg.get("type") == "message":
@@ -251,15 +294,10 @@ async def stream_job(job_id: str):
     async def event_stream():
         reader_task = loop.run_in_executor(None, reader)
         try:
-            # If the job already finished/failed before we subscribed, emit the
-            # terminal event immediately rather than waiting forever.
             job.refresh()
             status = job.get_status()
             if status == JobStatus.FINISHED:
-                yield _sse(
-                    "complete",
-                    {"job_id": job_id, "file": f"/api/simulate/{job_id}/result"},
-                )
+                yield _sse("complete", {"job_id": job_id})
                 return
             if status == JobStatus.FAILED:
                 yield _sse(
@@ -267,8 +305,6 @@ async def stream_job(job_id: str):
                 )
                 return
 
-            # Optional heartbeat so proxies/clients keep the connection open
-            # during long meshing/solve gaps with no progress messages.
             heartbeat = float(os.getenv("SSE_HEARTBEAT", "15"))
 
             while True:
@@ -306,25 +342,17 @@ async def stream_job(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Result
+# Result — reads the gzipped solution from the DB (written by the worker)
 # ---------------------------------------------------------------------------
 
 
-@app.get("/api/simulate/{job_id}/result", tags=["Model"])
-async def get_result(job_id: str):
-    job = _fetch_job(job_id)
-    await asyncio.sleep(2.5)  # Wait briefly for persistence
-
-    if job.get_status() == JobStatus.FINISHED and job.result is None:
-        await asyncio.sleep(0.5)  # Wait briefly for persistence
-        job.refresh()
-    if job.get_status() != JobStatus.FINISHED:
-        raise HTTPException(status_code=409, detail="Job not finished yet")
-    result = job.result
-    if result is None:
-        raise HTTPException(status_code=404, detail="No result available")
+@app.get("/api/instances/{public_id}/result", tags=["Model"])
+async def get_result(public_id: UUID, user=Depends(current_user)):
+    raw, is_solved = db.get_solution_bytes(user["sub"], str(public_id))
+    if not is_solved or raw is None:
+        raise HTTPException(status_code=409, detail="No solution yet")
     return Response(
-        content=result,
+        content=raw,
         media_type="application/json",
         headers={"Content-Encoding": "gzip"},
     )
