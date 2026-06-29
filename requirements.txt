@@ -20,3 +20,8 @@ fastapi
 pydantic
 rq
 uvicorn[standard]
+python-jose[cryptography]
+httpx
+psycopg2-binary
+python-multipart
+redis

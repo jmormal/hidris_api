@@ -6,20 +6,18 @@ Simulation API — ANUGA integration (push-based progress via Redis pub/sub)
 Requires a running Redis and at least one RQ worker:
     rq worker jobs:cpu --url redis://localhost:6379
 
-Flow:
-  1. POST /api/simulate   -> enqueues run_anuga_job, returns {job_id}
-  2. GET  /api/simulate/{job_id}/stream -> SSE driven by a Redis pub/sub
-     channel the worker publishes to (no polling for progress)
-  3. GET  /api/simulate/{job_id}/result -> returns the SimulationResult JSON
+Auth: tokens are issued by Keycloak (realm: hidris). This API only validates
+them. In Swagger, use the "Authorize" button -> it runs the Authorization
+Code + PKCE flow against Keycloak; log in as test/test.
 """
 
 import os
 import json
 import asyncio
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 
 from redis import Redis
 from rq import Queue
@@ -32,15 +30,22 @@ from rq.registry import (
     StartedJobRegistry,
 )
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, List, Optional
 
+from src.auth import current_user, CLIENT_ID
+import src.db as db
 from src.events import channel_for, decode
 
 
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+
+
+class InstanceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: Optional[str] = None
 
 
 class EnqueueResponse(BaseModel):
@@ -67,7 +72,6 @@ class JobsByStateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Redis / Queue
 # ---------------------------------------------------------------------------
-
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_QUEUE = os.getenv("REDIS_CPU", "jobs:gpu")
 
@@ -82,7 +86,13 @@ RESULT_TTL = int(os.getenv("RESULT_TTL", str(60 * 60 * 24)))
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI()
+app = FastAPI(
+    swagger_ui_init_oauth={
+        "clientId": CLIENT_ID,
+        "usePkceWithAuthorizationCodeGrant": True,
+        "scopes": "openid profile email",
+    },
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,9 +102,24 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Auth-related convenience endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/me", tags=["Auth"])
+async def me(user=Depends(current_user)):
+    return user
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Jobs (system)
+# ---------------------------------------------------------------------------
 
 
 @app.get("/jobs", response_model=JobsByStateResponse, tags=["System"])
@@ -116,12 +141,31 @@ def _fetch_job(job_id: str) -> Job:
 
 
 # ---------------------------------------------------------------------------
+# Instances of the user
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/instances", tags=["Model"])
+async def get_instances(user=Depends(current_user)):
+    return db.get_instances(user["sub"])
+
+
+@app.post("/api/instance", tags=["Model"], status_code=201)
+async def post_instance(payload: InstanceCreate, user=Depends(current_user)):
+    return db.create_instance(
+        user_id=user["sub"],
+        name=payload.name,
+        description=payload.description,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Submit -> enqueue
 # ---------------------------------------------------------------------------
 
 
 @app.post("/api/simulate", response_model=EnqueueResponse, tags=["Model"])
-async def submit_simulation(payload: dict):
+async def submit_simulation(payload: dict, user=Depends(current_user)):
     job = q.enqueue(
         "tasks.run_anuga",
         payload,
@@ -269,8 +313,7 @@ async def stream_job(job_id: str):
 @app.get("/api/simulate/{job_id}/result", tags=["Model"])
 async def get_result(job_id: str):
     job = _fetch_job(job_id)
-    await asyncio.sleep(5.5)  # Wait briefly for persistence
-    print(job)
+    await asyncio.sleep(2.5)  # Wait briefly for persistence
 
     if job.get_status() == JobStatus.FINISHED and job.result is None:
         await asyncio.sleep(0.5)  # Wait briefly for persistence
