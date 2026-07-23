@@ -7,6 +7,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from psycopg2.pool import ThreadedConnectionPool
 
+import io
+import numpy as np
+
 _pool = ThreadedConnectionPool(
     minconn=1,
     maxconn=10,
@@ -207,5 +210,73 @@ def save_solution_bytes(public_id: str, gz: bytes):
         conn.commit()
 
 
+# ── add to your existing db.py (reuses get_conn from that module) ──
+
+
+def init_db_storms():
+    """
+    Create the storm raster schema (catalog + raster data) and its indexes.
+    Idempotent — safe to call on every startup, like init_db().
+
+    Requires the postgis and postgis_raster extensions; we create them here
+    too so a fresh database is self-contained.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis_raster;")
+
+            # storm catalog — id comes from the folder name (provided, not serial)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS storm_catalog (
+                    id          INT PRIMARY KEY,
+                    name        VARCHAR(100),
+                    year        INT,
+                    description TEXT,
+                    created_at  TIMESTAMPTZ DEFAULT now()
+                );
+            """)
+
+            # raster frames. measure_type defaults to rain_depth; interval_min
+            # is the minutes each frame spans (needed when accumulating rates).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS storm_raster_data (
+                    id            BIGSERIAL PRIMARY KEY,
+                    storm_id      INT NOT NULL
+                                  REFERENCES storm_catalog(id) ON DELETE CASCADE,
+                    recorded_at   TIMESTAMPTZ NOT NULL,
+                    measure_type  VARCHAR(16) NOT NULL DEFAULT 'rain_depth',
+                    interval_min  INT NOT NULL DEFAULT 10,
+                    rast          RASTER NOT NULL
+                );
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_storm_raster_spatial
+                    ON storm_raster_data USING gist (ST_ConvexHull(rast));
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_storm_raster_lookup
+                    ON storm_raster_data (storm_id, measure_type, recorded_at);
+            """)
+        conn.commit()
+
+
+def load_storm_functions(sql_path: str = "sql/02_functions.sql"):
+    """
+    Load (or reload) the Martin tile/value functions from the .sql file.
+    Kept separate from init_db_storms() because the PL/pgSQL bodies are long
+    and change independently of the schema. CREATE OR REPLACE makes this
+    safe to re-run.
+    """
+    with open(sql_path, "r", encoding="utf-8") as f:
+        sql = f.read()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
 if __name__ == "__main__":
-    init_db()
+    init_db()  # your existing simulations table
+    init_db_storms()  # storm catalog + raster
