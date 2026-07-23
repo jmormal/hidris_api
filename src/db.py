@@ -256,6 +256,13 @@ def init_storms():
                     -- allocation ceiling for a big multi-frame cube. Large
                     -- objects are streamed instead.
                     data_grid_oid OID NOT NULL,
+                    -- Precomputed accumulated-rain grid (H,W), gzip'd — small
+                    -- enough to stay inline. Computed once at upload time so
+                    -- GET /preview never has to decompress the full (T,H,W)
+                    -- cube just to sum it.
+                    preview_grid BYTEA,
+                    preview_min  REAL,
+                    preview_max  REAL,
                     created_at   TIMESTAMPTZ DEFAULT now()
                 );
             """)
@@ -263,11 +270,15 @@ def init_storms():
                 "CREATE INDEX IF NOT EXISTS idx_storms_event_date "
                 "ON storms (event_date);"
             )
-            # Migration for tables created before center_lng/lat and the
-            # large-object storage switch existed. Idempotent.
+            # Migration for tables created before center_lng/lat, the
+            # large-object storage switch, and the preview cache existed.
+            # Idempotent.
             cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS center_lng DOUBLE PRECISION;")
             cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS center_lat DOUBLE PRECISION;")
             cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS data_grid_oid OID;")
+            cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS preview_grid BYTEA;")
+            cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS preview_min REAL;")
+            cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS preview_max REAL;")
             cur.execute("""
                 DO $$
                 BEGIN
@@ -349,6 +360,67 @@ def get_storm_cube(public_id: str):
                 lo.close()
             cube = _decompress_cube(raw)
             return cube, row
+
+
+def get_storm_preview_grid(public_id: str):
+    """
+    Accumulated-rain grid (H,W) for the map bitmap. Reads the small
+    precomputed `preview_grid` — never touches the (T,H,W) cube/large object
+    — so this stays fast regardless of how many frames the storm has.
+
+    Returns (grid, rows, cols, min, max) or (None, None, None, None, None).
+    Falls back to computing it from the full cube for the rare pre-migration
+    row that predates the preview cache.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT grid_rows, grid_cols, preview_grid, preview_min, preview_max
+                FROM storms WHERE public_id = %s;
+            """,
+                (public_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None, None, None, None, None
+            if row["preview_grid"] is not None:
+                grid = _decompress_cube(bytes(row["preview_grid"]))
+                return grid, row["grid_rows"], row["grid_cols"], row["preview_min"], row["preview_max"]
+
+    # Fallback: no cached preview yet (row predates this feature) — compute
+    # it once from the full cube. Slow, but self-heals: recompute_preview
+    # below persists the result so this only happens the first time.
+    cube, meta = get_storm_cube(public_id)
+    if cube is None:
+        return None, None, None, None, None
+    grid = _accumulate(cube, meta["units"], meta["timestep_s"])
+    _save_preview_grid(public_id, grid)
+    return grid, meta["grid_rows"], meta["grid_cols"], float(grid.min()), float(grid.max())
+
+
+def _accumulate(cube: np.ndarray, units: str, timestep_s) -> np.ndarray:
+    """Per-cell accumulated depth (mm) across every frame."""
+    if units == "mm_hr":
+        accum = (cube * (float(timestep_s) / 3600.0)).sum(axis=0)
+    else:
+        accum = cube.sum(axis=0)
+    return np.nan_to_num(accum, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _save_preview_grid(public_id: str, grid: np.ndarray):
+    blob = compress_cube(grid)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE storms
+                SET preview_grid = %s, preview_min = %s, preview_max = %s
+                WHERE public_id = %s;
+            """,
+                (psycopg2.Binary(blob), float(grid.min()), float(grid.max()), public_id),
+            )
+        conn.commit()
 
 
 def compress_cube(cube: np.ndarray) -> bytes:
@@ -460,6 +532,11 @@ def insert_storm(
         total_depth_mm = float((valid * (timestep_s / 3600.0)).sum(axis=0).max())
         peak_intensity_mm_hr = float(valid.max())
 
+    # Precompute the accumulated-rain preview grid once here, so GET /preview
+    # is just a small-blob read instead of decompressing the whole cube.
+    preview_grid = _accumulate(valid, units, timestep_s)
+    preview_blob = compress_cube(preview_grid)
+
     blob = compress_cube(cube)
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -479,8 +556,9 @@ def insert_storm(
                     (name, description, event_date, timestep_s, n_frames,
                      grid_rows, grid_cols, cell_size_m, units, nodata,
                      center_lng, center_lat,
-                     total_depth_mm, peak_intensity_mm_hr, data_grid_oid)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     total_depth_mm, peak_intensity_mm_hr, data_grid_oid,
+                     preview_grid, preview_min, preview_max)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 RETURNING public_id;
             """,
                 (
@@ -499,6 +577,9 @@ def insert_storm(
                     round(total_depth_mm, 2),
                     round(peak_intensity_mm_hr, 2),
                     oid,
+                    psycopg2.Binary(preview_blob),
+                    float(preview_grid.min()),
+                    float(preview_grid.max()),
                 ),
             )
             pid = cur.fetchone()["public_id"]

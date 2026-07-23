@@ -19,11 +19,11 @@ from datetime import date
 
 from uuid import UUID
 
-import numpy as np
 import rasterio
 from fastapi import FastAPI, HTTPException, Response, Depends, UploadFile, File, Form
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 
 from redis import Redis
@@ -113,7 +113,9 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Rows", "X-Cols", "X-Min", "X-Max"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 @app.on_event("startup")
@@ -426,27 +428,33 @@ async def get_storm_preview(public_id: UUID, user=Depends(current_user)):
     """
     Accumulated rainfall (mm) per cell, summed across every frame — the
     bitmap shown when a storm is placed on the map.
+
+    Returns raw little-endian float32 bytes (row-major), not JSON — a
+    rows*cols float array as JSON text is several times larger and much
+    slower for the browser to parse than reading it straight into a
+    Float32Array. Shape/range travel as headers since the body is just the
+    array. GZipMiddleware compresses the response further (rain grids are
+    mostly uniform/zero, so this compresses well).
     """
-    # Decompressing the cube (gzip) is CPU-bound — keep it off the event loop.
-    cube, meta = await run_in_threadpool(db.get_storm_cube, str(public_id))
-    if cube is None:
+    # Reads the small precomputed grid — never decompresses the full cube —
+    # but still off the event loop since it may fall back to that for a
+    # pre-migration row.
+    grid, rows, cols, gmin, gmax = await run_in_threadpool(
+        db.get_storm_preview_grid, str(public_id)
+    )
+    if grid is None:
         raise HTTPException(status_code=404, detail="Storm not found")
 
-    timestep_s = float(meta["timestep_s"])
-    if meta["units"] == "mm_hr":
-        accum = (cube * (timestep_s / 3600.0)).sum(axis=0)
-    else:
-        accum = cube.sum(axis=0)
-    accum = np.nan_to_num(accum, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return {
-        "rows": int(accum.shape[0]),
-        "cols": int(accum.shape[1]),
-        "units": "mm",
-        "values": accum.astype(float).flatten().tolist(),
-        "min": float(accum.min()),
-        "max": float(accum.max()),
-    }
+    return Response(
+        content=grid.astype("<f4").tobytes(),
+        media_type="application/octet-stream",
+        headers={
+            "X-Rows": str(rows),
+            "X-Cols": str(cols),
+            "X-Min": repr(gmin),
+            "X-Max": repr(gmax),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
