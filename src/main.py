@@ -14,10 +14,15 @@ cannot send an Authorization header.
 import os
 import json
 import asyncio
+import contextlib
+from datetime import date
 
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Response, Depends
+import numpy as np
+import rasterio
+from fastapi import FastAPI, HTTPException, Response, Depends, UploadFile, File, Form
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -113,8 +118,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
-    # Idempotent; ensures the table exists before the first request.
+    # Idempotent; ensures the tables exist before the first request.
     db.init_db()
+    db.init_storms()
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +345,108 @@ async def stream_job(job_id: str, user=Depends(current_user_from_query)):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Storms — historical rainfall catalog (shared reference data, not per-user)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/storms", tags=["Storms"])
+async def list_storms(user=Depends(current_user)):
+    return db.list_storms()
+
+
+@app.get("/api/storms/{public_id}", tags=["Storms"])
+async def get_storm(public_id: UUID, user=Depends(current_user)):
+    row = db.get_storm_meta(str(public_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Storm not found")
+    return row
+
+
+@app.post("/api/storms", tags=["Storms"], status_code=201)
+async def create_storm(
+    files: List[UploadFile] = File(...),
+    name: str = Form(...),
+    description: Optional[str] = Form(None),
+    event_date: Optional[str] = Form(None),
+    timestep_s: int = Form(...),
+    units: str = Form("mm_per_step"),
+    user=Depends(current_user),
+):
+    """
+    Frames are stacked in the order `files` arrives in the multipart body —
+    the client is responsible for ordering them (see AddStormModal).
+    """
+    if units not in ("mm_per_step", "mm_hr"):
+        raise HTTPException(
+            status_code=400, detail="units must be mm_per_step or mm_hr"
+        )
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one raster is required")
+
+    with contextlib.ExitStack() as stack:
+        readers = []
+        for f in files:
+            data = await f.read()
+            memfile = stack.enter_context(rasterio.MemoryFile(data))
+            readers.append(stack.enter_context(memfile.open()))
+        try:
+            # Stacking + normalising every frame is CPU-bound (and, for
+            # real-resolution rasters, not fast) — running it inline would
+            # block the whole event loop for the duration of the upload.
+            cube, cell_size_m, nodata, center_lng, center_lat = await run_in_threadpool(
+                db.build_cube_from_rasters, readers
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    ev = date.fromisoformat(event_date) if event_date else None
+
+    # gzip-compressing the cube and writing the blob is also CPU-bound.
+    public_id = await run_in_threadpool(
+        db.insert_storm,
+        name=name,
+        description=description,
+        event_date=ev,
+        timestep_s=timestep_s,
+        cube=cube,
+        cell_size_m=cell_size_m,
+        units=units,
+        nodata=nodata,
+        center_lng=center_lng,
+        center_lat=center_lat,
+    )
+    return {"public_id": public_id}
+
+
+@app.get("/api/storms/{public_id}/preview", tags=["Storms"])
+async def get_storm_preview(public_id: UUID, user=Depends(current_user)):
+    """
+    Accumulated rainfall (mm) per cell, summed across every frame — the
+    bitmap shown when a storm is placed on the map.
+    """
+    # Decompressing the cube (gzip) is CPU-bound — keep it off the event loop.
+    cube, meta = await run_in_threadpool(db.get_storm_cube, str(public_id))
+    if cube is None:
+        raise HTTPException(status_code=404, detail="Storm not found")
+
+    timestep_s = float(meta["timestep_s"])
+    if meta["units"] == "mm_hr":
+        accum = (cube * (timestep_s / 3600.0)).sum(axis=0)
+    else:
+        accum = cube.sum(axis=0)
+    accum = np.nan_to_num(accum, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return {
+        "rows": int(accum.shape[0]),
+        "cols": int(accum.shape[1]),
+        "units": "mm",
+        "values": accum.astype(float).flatten().tolist(),
+        "min": float(accum.min()),
+        "max": float(accum.max()),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ Notes:
 """
 
 import argparse
+import contextlib
 import glob
 import re
 import sys
@@ -32,9 +33,8 @@ from datetime import date
 import numpy as np
 import rasterio
 
-# Reuse the storms helpers. Adjust the import to your worker's layout.
-import db                      # the module that has get_conn (your db.py)
-import db_storms as ds
+# Reuse the storms helpers.
+import db
 
 
 def _sort_key_numeric(path):
@@ -47,35 +47,12 @@ def load_cube(paths, sort_numeric=False):
     if not paths:
         raise SystemExit("No TIFF files matched.")
 
-    frames = []
-    cell_size_m = None
-    nodata = None
-    shape = None
-
-    for p in paths:
-        with rasterio.open(p) as src:
-            arr = src.read(1).astype(np.float32)  # band 1
-            if shape is None:
-                shape = arr.shape
-                # |a| is x pixel size; |e| is y pixel size. Assume square cells.
-                cell_size_m = float(abs(src.transform.a))
-                nodata = src.nodata
-            elif arr.shape != shape:
-                raise SystemExit(
-                    f"Frame {p} shape {arr.shape} != first frame {shape}. "
-                    "All frames must share the same grid."
-                )
-            frames.append(arr)
-
-    cube = np.stack(frames, axis=0)  # (T, H, W)
-
-    # Normalise nodata / non-finite to 0 rain
-    if nodata is not None:
-        cube[cube == nodata] = 0.0
-    cube[~np.isfinite(cube)] = 0.0
-    cube[cube < 0] = 0.0  # negative rain is nonsense
-
-    return cube, cell_size_m, nodata
+    with contextlib.ExitStack() as stack:
+        readers = [stack.enter_context(rasterio.open(p)) for p in paths]
+        try:
+            return db.build_cube_from_rasters(readers)
+        except ValueError as e:
+            raise SystemExit(str(e))
 
 
 def main():
@@ -95,19 +72,19 @@ def main():
     args = ap.parse_args()
 
     paths = glob.glob(args.glob)
-    cube, cell_size_m, nodata = load_cube(paths, args.sort_numeric)
+    cube, cell_size_m, nodata, center_lng, center_lat = load_cube(paths, args.sort_numeric)
     if args.cell_size:
         cell_size_m = args.cell_size
 
     ev = date.fromisoformat(args.event_date) if args.event_date else None
 
     print(f"Loaded {cube.shape[0]} frames, grid {cube.shape[1]}x{cube.shape[2]}, "
-          f"cell {cell_size_m} m, nodata={nodata}, units={args.units}")
+          f"cell {cell_size_m} m, nodata={nodata}, units={args.units}, "
+          f"center=({center_lng}, {center_lat})")
     print(f"Raw cube size: {cube.nbytes / 1e6:.1f} MB; compressing…")
 
-    ds.init_storms(db.get_conn)
-    pid = ds.insert_storm(
-        db.get_conn,
+    db.init_storms()
+    pid = db.insert_storm(
         name=args.name,
         description=args.description,
         event_date=ev,
@@ -116,6 +93,8 @@ def main():
         cell_size_m=cell_size_m,
         units=args.units,
         nodata=nodata,
+        center_lng=center_lng,
+        center_lat=center_lat,
     )
     print(f"Inserted storm {pid}")
 

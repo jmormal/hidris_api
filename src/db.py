@@ -24,10 +24,18 @@ _pool = ThreadedConnectionPool(
 @contextmanager
 def get_conn():
     conn = _pool.getconn()
+    broken = False
     try:
         yield conn
+    except psycopg2.OperationalError:
+        # Connection itself is dead (e.g. "SSL connection has been closed
+        # unexpectedly") — discard it instead of returning it to the pool,
+        # otherwise every subsequent request keeps drawing the same broken
+        # connection and fails identically.
+        broken = True
+        raise
     finally:
-        _pool.putconn(conn)
+        _pool.putconn(conn, close=broken)
 
 
 def init_db():
@@ -208,6 +216,294 @@ def save_solution_bytes(public_id: str, gz: bytes):
                 (psycopg2.Binary(gz), public_id),
             )
         conn.commit()
+
+
+# ── Historical storms (compressed rain cube, shared reference data) ──
+#
+# A storm is a (T, H, W) float32 grid of rainfall per timestep, gzip-
+# compressed and stored whole in `data_grid`. No user_id — storms are a
+# shared catalog, not per-user data (unlike `simulations`).
+
+
+def init_storms():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS storms (
+                    id           SERIAL PRIMARY KEY,
+                    public_id    UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+                    name         VARCHAR(255) NOT NULL,
+                    description  TEXT,
+                    event_date   DATE,
+                    timestep_s   INTEGER NOT NULL,
+                    n_frames     INTEGER NOT NULL,
+                    grid_rows    INTEGER NOT NULL,
+                    grid_cols    INTEGER NOT NULL,
+                    cell_size_m  REAL NOT NULL,
+                    units        VARCHAR(16) NOT NULL DEFAULT 'mm_per_step',
+                    nodata       REAL,
+                    -- Geographic center of the source rasters (WGS84), used to
+                    -- default-place the storm where it actually occurred.
+                    -- Nullable: older rows, or a source CRS that couldn't be
+                    -- reprojected, just fall back to the map's default view.
+                    center_lng   DOUBLE PRECISION,
+                    center_lat   DOUBLE PRECISION,
+                    total_depth_mm       REAL,
+                    peak_intensity_mm_hr REAL,
+                    -- Large object OID, not inline BYTEA: psycopg2 sends bytea
+                    -- parameters as hex-escaped SQL text, which roughly doubles
+                    -- their size and can blow past Postgres's 1GB single-value/
+                    -- allocation ceiling for a big multi-frame cube. Large
+                    -- objects are streamed instead.
+                    data_grid_oid OID NOT NULL,
+                    created_at   TIMESTAMPTZ DEFAULT now()
+                );
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_storms_event_date "
+                "ON storms (event_date);"
+            )
+            # Migration for tables created before center_lng/lat and the
+            # large-object storage switch existed. Idempotent.
+            cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS center_lng DOUBLE PRECISION;")
+            cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS center_lat DOUBLE PRECISION;")
+            cur.execute("ALTER TABLE storms ADD COLUMN IF NOT EXISTS data_grid_oid OID;")
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'storms' AND column_name = 'data_grid'
+                    ) THEN
+                        ALTER TABLE storms ALTER COLUMN data_grid DROP NOT NULL;
+                    END IF;
+                END $$;
+            """)
+        conn.commit()
+
+
+def list_storms():
+    """Summary rows for the picker — never selects the heavy data_grid."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT public_id, name, description, event_date,
+                       timestep_s, n_frames, grid_rows, grid_cols,
+                       cell_size_m, units, center_lng, center_lat,
+                       total_depth_mm, peak_intensity_mm_hr,
+                       created_at
+                FROM storms
+                ORDER BY event_date DESC NULLS LAST, name;
+            """)
+            return cur.fetchall()
+
+
+def get_storm_meta(public_id: str):
+    """Metadata only (no cube) — used to build the placement feature."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT public_id, name, description, event_date,
+                       timestep_s, n_frames, grid_rows, grid_cols,
+                       cell_size_m, units, nodata, center_lng, center_lat,
+                       total_depth_mm, peak_intensity_mm_hr
+                FROM storms
+                WHERE public_id = %s;
+            """,
+                (public_id,),
+            )
+            return cur.fetchone()
+
+
+def get_storm_cube(public_id: str):
+    """Worker-side. Returns (cube ndarray (T,H,W) float32, meta dict) or (None, None)."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT timestep_s, n_frames, grid_rows, grid_cols,
+                       cell_size_m, units, nodata, data_grid_oid, data_grid
+                FROM storms
+                WHERE public_id = %s;
+            """,
+                (public_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None, None
+            oid = row.pop("data_grid_oid")
+            legacy_blob = row.pop("data_grid", None)
+            if oid is None:
+                # Pre-migration row: the cube is still in the old inline
+                # bytea column (only possible for storms inserted before the
+                # large-object switch).
+                if legacy_blob is None:
+                    return None, None
+                cube = _decompress_cube(bytes(legacy_blob))
+                return cube, row
+            lo = conn.lobject(oid, "rb")
+            try:
+                raw = lo.read()
+            finally:
+                lo.close()
+            cube = _decompress_cube(raw)
+            return cube, row
+
+
+def compress_cube(cube: np.ndarray) -> bytes:
+    """(T,H,W) float32 -> gzipped .npy bytes. Rainfall is mostly zeros, so this
+    compresses hard."""
+    cube = np.ascontiguousarray(cube, dtype=np.float32)
+    buf = io.BytesIO()
+    np.save(buf, cube)
+    return gzip.compress(buf.getvalue(), compresslevel=6)
+
+
+def _decompress_cube(raw: bytes) -> np.ndarray:
+    buf = io.BytesIO(gzip.decompress(raw))
+    return np.load(buf)
+
+
+def build_cube_from_rasters(readers: list):
+    """
+    Stack a list of already-opened, same-shaped rasterio datasets (in the
+    desired frame order) into a (T,H,W) float32 cube, normalising nodata /
+    non-finite / negative values to 0. Returns (cube, cell_size_m, nodata,
+    center_lng, center_lat) — the last two are the first raster's own centre,
+    reprojected to WGS84 (None if that fails), so a newly-added storm can
+    default-place itself where it actually occurred instead of on the map's
+    generic default view.
+
+    Shared by seed_storms.py (opens from disk paths) and the /api/storms
+    upload endpoint (opens from uploaded bytes via rasterio.MemoryFile) so
+    the normalisation logic can't drift between the two entry points.
+    """
+    if not readers:
+        raise ValueError("No rasters provided")
+
+    frames = []
+    cell_size_m = None
+    nodata = None
+    shape = None
+    center_lng = None
+    center_lat = None
+
+    for src in readers:
+        arr = src.read(1).astype(np.float32)  # band 1
+        if shape is None:
+            shape = arr.shape
+            cell_size_m = float(abs(src.transform.a))
+            nodata = src.nodata
+            center_lng, center_lat = _raster_center_wgs84(src)
+        elif arr.shape != shape:
+            raise ValueError(
+                f"Frame shape {arr.shape} != first frame shape {shape}. "
+                "All frames must share the same grid."
+            )
+        frames.append(arr)
+
+    cube = np.stack(frames, axis=0)  # (T, H, W)
+
+    if nodata is not None:
+        cube[cube == nodata] = 0.0
+    cube[~np.isfinite(cube)] = 0.0
+    cube[cube < 0] = 0.0  # negative rain is nonsense
+
+    return cube, cell_size_m, nodata, center_lng, center_lat
+
+
+def _raster_center_wgs84(src):
+    """(lon, lat) of a rasterio dataset's own centre pixel, in EPSG:4326."""
+    try:
+        import rasterio.warp
+
+        rows, cols = src.height, src.width
+        cx, cy = src.transform * (cols / 2.0, rows / 2.0)
+        if src.crs is None:
+            return None, None
+        lngs, lats = rasterio.warp.transform(src.crs, "EPSG:4326", [cx], [cy])
+        return float(lngs[0]), float(lats[0])
+    except Exception:
+        # Best-effort — a missing/unparseable CRS shouldn't fail the upload,
+        # it just means the storm falls back to a generic default placement.
+        return None, None
+
+
+def insert_storm(
+    *,
+    name,
+    description,
+    event_date,
+    timestep_s,
+    cube: np.ndarray,
+    cell_size_m,
+    units="mm_per_step",
+    nodata=None,
+    center_lng=None,
+    center_lat=None,
+):
+    """Computes summary stats and stores the compressed cube."""
+    n_frames, rows, cols = cube.shape
+
+    valid = cube.copy()
+    if nodata is not None:
+        valid[valid == nodata] = 0.0
+    valid[~np.isfinite(valid)] = 0.0
+
+    # depth conversion for summary stats
+    if units == "mm_per_step":
+        # total depth at the wettest cell = sum over time of per-step depth
+        total_depth_mm = float(valid.sum(axis=0).max())
+        peak_intensity_mm_hr = float(valid.max() / (timestep_s / 3600.0))
+    else:  # mm_hr
+        total_depth_mm = float((valid * (timestep_s / 3600.0)).sum(axis=0).max())
+        peak_intensity_mm_hr = float(valid.max())
+
+    blob = compress_cube(cube)
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Large object: streamed in chunks, not embedded as hex-escaped
+            # SQL text, so it isn't subject to Postgres's 1GB single-value/
+            # allocation limit the way a big bytea query parameter would be.
+            lo = conn.lobject(0, "wb")
+            try:
+                lo.write(blob)
+                oid = lo.oid
+            finally:
+                lo.close()
+
+            cur.execute(
+                """
+                INSERT INTO storms
+                    (name, description, event_date, timestep_s, n_frames,
+                     grid_rows, grid_cols, cell_size_m, units, nodata,
+                     center_lng, center_lat,
+                     total_depth_mm, peak_intensity_mm_hr, data_grid_oid)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING public_id;
+            """,
+                (
+                    name,
+                    description,
+                    event_date,
+                    timestep_s,
+                    n_frames,
+                    rows,
+                    cols,
+                    cell_size_m,
+                    units,
+                    nodata,
+                    center_lng,
+                    center_lat,
+                    round(total_depth_mm, 2),
+                    round(peak_intensity_mm_hr, 2),
+                    oid,
+                ),
+            )
+            pid = cur.fetchone()["public_id"]
+        conn.commit()
+        return pid
 
 
 # ── add to your existing db.py (reuses get_conn from that module) ──
