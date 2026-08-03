@@ -88,9 +88,12 @@ class JobsByStateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_QUEUE = os.getenv("REDIS_CPU", "jobs:gpu")
+REDIS_QUEUE_CLUSTER_GPU = os.getenv("REDIS_GPU", "jobs:cluster:gpu")
+REDIS_QUEUE_CLUSTER_CPU = os.getenv("REDIS_CPU", "jobs:cluster:cpu")
 
 redis_conn = Redis.from_url(REDIS_URL)
 q = Queue(REDIS_QUEUE, connection=redis_conn)
+q_cluster_gpu = Queue(REDIS_QUEUE_CLUSTER_GPU, connection=redis_conn)
 
 JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "3600"))
 RESULT_TTL = int(os.getenv("RESULT_TTL", str(60 * 60 * 24)))
