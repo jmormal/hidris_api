@@ -470,8 +470,11 @@ async def get_result(public_id: UUID, user=Depends(current_user)):
     raw, is_solved = db.get_solution_bytes(user["sub"], str(public_id))
     if not is_solved or raw is None:
         raise HTTPException(status_code=409, detail="No solution yet")
+    # Binary container (see worker-gpu/src/tasks.py _encode_result_binary),
+    # not JSON — the frontend reads it with response.arrayBuffer().
+    # Content-Encoding stays gzip so the browser still inflates in transit.
     return Response(
         content=raw,
-        media_type="application/json",
+        media_type="application/octet-stream",
         headers={"Content-Encoding": "gzip"},
     )
