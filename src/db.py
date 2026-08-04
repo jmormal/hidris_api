@@ -52,13 +52,23 @@ def init_db():
                     updated_at   TIMESTAMPTZ DEFAULT now(),
                     is_solved    BOOLEAN NOT NULL DEFAULT FALSE,
                     instance     JSONB,
-                    solution     BYTEA
+                    -- Legacy inline storage. Kept for rows written before the
+                    -- large-object switch; new solutions go to solution_oid.
+                    solution     BYTEA,
+                    -- Large object OID, not inline BYTEA: psycopg2 sends bytea
+                    -- parameters as hex-escaped SQL text, which doubles their
+                    -- size, so a ~500MB gzipped solution blows past Postgres's
+                    -- 1GB single-allocation ceiling ("invalid memory alloc
+                    -- request size"). Large objects are streamed instead.
+                    solution_oid OID
                 );
             """)
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_simulations_user_id "
                 "ON simulations (user_id);"
             )
+            # Migration for tables created before the large-object switch.
+            cur.execute("ALTER TABLE simulations ADD COLUMN IF NOT EXISTS solution_oid OID;")
         conn.commit()
 
 
@@ -146,6 +156,8 @@ def update_instance(
                 """,
                 # is_solved = TRUE,
                 # solution = NULL,
+                # solution_oid = NULL,  -- and lo_unlink the old oid, see
+                #                       -- worker-gpu/src/db.py:update_instance
                 (
                     name,
                     description,
@@ -162,21 +174,40 @@ def update_instance(
 def delete_instance(user_id: str, public_id: str) -> bool:
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Large objects are not owned by the row — dropping it would leak
+            # the storage, so unlink explicitly in the same transaction.
             cur.execute(
-                "DELETE FROM simulations WHERE public_id = %s AND user_id = %s;",
+                "DELETE FROM simulations WHERE public_id = %s AND user_id = %s "
+                "RETURNING solution_oid;",
                 (public_id, user_id),
             )
-            deleted = cur.rowcount > 0
+            row = cur.fetchone()
+            deleted = row is not None
+            if deleted and row[0] is not None:
+                _unlink_lobject(cur, row[0])
         conn.commit()
         return deleted
 
 
+def _unlink_lobject(cur, oid: int) -> None:
+    """Drop a large object, tolerating one that's already gone."""
+    try:
+        cur.execute("SELECT lo_unlink(%s);", (oid,))
+    except psycopg2.Error as e:
+        print(f"DB: could not unlink large object {oid}: {e}")
+
+
+SOLUTION_CHUNK = 8 << 20  # 8 MiB — bounds peak memory when streaming a result
+
+
 def get_solution_bytes(user_id: str, public_id: str):
+    """Whole solution in memory. Prefer iter_solution_bytes for serving —
+    a solved basin is routinely hundreds of MB gzipped."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT solution, is_solved
+                SELECT solution, solution_oid, is_solved
                 FROM simulations
                 WHERE public_id = %s AND user_id = %s;
                 """,
@@ -185,8 +216,70 @@ def get_solution_bytes(user_id: str, public_id: str):
             row = cur.fetchone()
             if row is None:
                 return None, None
-            solution, is_solved = row
+            solution, oid, is_solved = row
+            if oid is not None:
+                lo = conn.lobject(oid, "rb")
+                try:
+                    return lo.read(), is_solved
+                finally:
+                    lo.close()
             return (bytes(solution) if solution is not None else None), is_solved
+
+
+def open_solution(user_id: str, public_id: str):
+    """
+    Returns (size_bytes, chunk_iterator, is_solved) for a stored solution, or
+    (None, None, is_solved) when there is nothing to serve. The iterator holds
+    a pooled connection open until exhausted or closed — consume it fully
+    (StreamingResponse does) rather than letting it go out of scope.
+    """
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT solution, solution_oid, is_solved
+                FROM simulations
+                WHERE public_id = %s AND user_id = %s;
+                """,
+                (public_id, user_id),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None, None, None
+        solution, oid, is_solved = row
+
+        if oid is None:
+            # Legacy inline row (or no solution yet) — nothing to stream.
+            conn.rollback()
+            _pool.putconn(conn)
+            if solution is None:
+                return None, None, is_solved
+            blob = bytes(solution)
+            return len(blob), iter((blob,)), is_solved
+
+        lo = conn.lobject(oid, "rb")
+        size = lo.seek(0, 2)
+        lo.seek(0, 0)
+    except Exception:
+        _pool.putconn(conn, close=True)
+        raise
+
+    def _chunks():
+        try:
+            while True:
+                chunk = lo.read(SOLUTION_CHUNK)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                lo.close()
+                conn.rollback()
+            finally:
+                _pool.putconn(conn)
+
+    return size, _chunks(), is_solved
 
 
 def save_solution(public_id: str, dataset: dict):
@@ -204,17 +297,46 @@ def save_solution_bytes(public_id: str, gz: bytes):
     """
     Worker-side. Stores already-gzipped solution bytes and flips is_solved.
     Keyed by public_id only — the worker acts on behalf of the owner.
+
+    Written as a large object streamed in chunks: as an inline bytea parameter
+    psycopg2 hex-escapes the blob into the SQL text, doubling it, and anything
+    past ~500MB makes the server reject the statement with "invalid memory
+    alloc request size". Any previous solution's large object is unlinked so
+    re-running a simulation doesn't leak its storage.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
+            lo = conn.lobject(0, "wb")
+            try:
+                for off in range(0, len(gz), SOLUTION_CHUNK):
+                    lo.write(gz[off:off + SOLUTION_CHUNK])
+                oid = lo.oid
+            finally:
+                lo.close()
+
+            cur.execute(
+                "SELECT solution_oid FROM simulations "
+                "WHERE public_id = %s FOR UPDATE;",
+                (public_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # No such instance — don't strand the object we just wrote.
+                _unlink_lobject(cur, oid)
+                conn.commit()
+                raise LookupError(f"no simulation with public_id {public_id}")
+
             cur.execute(
                 """
                 UPDATE simulations
-                SET solution = %s, is_solved = TRUE, updated_at = now()
+                SET solution = NULL, solution_oid = %s,
+                    is_solved = TRUE, updated_at = now()
                 WHERE public_id = %s;
                 """,
-                (psycopg2.Binary(gz), public_id),
+                (oid, public_id),
             )
+            if row[0] is not None and row[0] != oid:
+                _unlink_lobject(cur, row[0])
         conn.commit()
 
 

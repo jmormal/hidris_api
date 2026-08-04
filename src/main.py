@@ -95,7 +95,7 @@ redis_conn = Redis.from_url(REDIS_URL)
 q = Queue(REDIS_QUEUE, connection=redis_conn)
 q_cluster_gpu = Queue(REDIS_QUEUE_CLUSTER_GPU, connection=redis_conn)
 
-JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "3600"))
+JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "80600"))
 RESULT_TTL = int(os.getenv("RESULT_TTL", str(60 * 60 * 24)))
 
 
@@ -467,14 +467,21 @@ async def get_storm_preview(public_id: UUID, user=Depends(current_user)):
 
 @app.get("/api/instances/{public_id}/result", tags=["Model"])
 async def get_result(public_id: UUID, user=Depends(current_user)):
-    raw, is_solved = db.get_solution_bytes(user["sub"], str(public_id))
-    if not is_solved or raw is None:
+    size, chunks, is_solved = db.open_solution(user["sub"], str(public_id))
+    if not is_solved or chunks is None:
         raise HTTPException(status_code=409, detail="No solution yet")
     # Binary container (see worker-gpu/src/tasks.py _encode_result_binary),
     # not JSON — the frontend reads it with response.arrayBuffer().
     # Content-Encoding stays gzip so the browser still inflates in transit.
-    return Response(
-        content=raw,
+    # Streamed from a Postgres large object in chunks: a solved basin runs to
+    # hundreds of MB, so buffering it whole would OOM the API pod.
+    # Content-Length describes the gzipped bytes on the wire, which is what
+    # we're sending, so the browser still gets a real download progress bar.
+    return StreamingResponse(
+        chunks,
         media_type="application/octet-stream",
-        headers={"Content-Encoding": "gzip"},
+        headers={
+            "Content-Encoding": "gzip",
+            "Content-Length": str(size),
+        },
     )
