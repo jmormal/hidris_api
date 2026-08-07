@@ -25,3 +25,4 @@ httpx
 psycopg2-binary
 python-multipart
 redis
+asyncssh

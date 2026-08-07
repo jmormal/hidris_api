@@ -24,7 +24,7 @@ from fastapi import FastAPI, HTTPException, Response, Depends, UploadFile, File,
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from redis import Redis
 from rq import Queue
@@ -43,7 +43,8 @@ from typing import Any, List, Optional
 from src.auth import current_user, current_user_from_query, CLIENT_ID
 import src.db as db
 from src.events import channel_for, decode
-
+import src.hpc as hpc
+from src.remote import RemoteError
 
 # ---------------------------------------------------------------------------
 # Models
@@ -146,6 +147,67 @@ async def me(user=Depends(current_user)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.exception_handler(RemoteError)
+async def _remote_error_handler(request, exc: RemoteError):
+    """Anything that failed on the far side of the tailnet is a 502, not a 500.
+
+    Applied app-wide so every HPC route gets it without repeating a try/except:
+    the failure is upstream of this API, and the caller should be able to tell
+    that apart from a bug in the request.
+    """
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
+@app.get("/health/ssh", tags=["System"])
+async def health_ssh(user=Depends(current_user)):
+    """Smoke test for the tailnet path to the HPC login node (see src/remote.py)."""
+    return {"partitions": await hpc.partitions()}
+
+
+# ---------------------------------------------------------------------------
+# HPC — Slurm job control over SSH (see src/hpc.py)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/hpc/probe", tags=["HPC"], status_code=202)
+async def submit_hpc_probe(user=Depends(current_user)):
+    """
+    Queue the connectivity probe (services/hpc-probe) on a compute node.
+
+    Answers whether a compute node can reach this cluster's Redis and Postgres
+    over Tailscale, and by which transport — the open question blocking real
+    simulations from running there. Returns immediately with a job id; poll
+    GET /api/hpc/probe/{job_id} for the verdict.
+    """
+    job_id = await hpc.submit_probe()
+    return {"job_id": job_id, "state": "PENDING"}
+
+
+@app.get("/api/hpc/probe/{job_id}", tags=["HPC"])
+async def get_hpc_probe(job_id: str, log_lines: int = 200, user=Depends(current_user)):
+    """
+    State of a probe job, plus its report once it has written one.
+
+    `result` stays null while the job is PENDING/RUNNING. `verdict` is lifted
+    to the top level as the one field worth reading: which transports reached
+    both services, and which of those the unmodified worker db.py could use.
+    """
+    try:
+        state = await hpc.job_state(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    result = await hpc.probe_result(job_id)
+    return {
+        "job_id": job_id,
+        "state": state,
+        "done": state not in ("PENDING", "RUNNING", "CONFIGURING", "COMPLETING"),
+        "verdict": (result or {}).get("verdict"),
+        "result": result,
+        "log": await hpc.probe_log(job_id, lines=log_lines),
+    }
 
 
 # ---------------------------------------------------------------------------
