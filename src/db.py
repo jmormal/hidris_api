@@ -171,6 +171,45 @@ def update_instance(
         return row
 
 
+def clone_instance(user_id: str, public_id: str, name: str | None = None):
+    """
+    Copy an instance's setup into a brand-new row for the same user.
+
+    The solution columns (solution / solution_oid / is_solved) are deliberately
+    left at their defaults: a clone starts unsolved, and the large object is
+    owned by the original row (copying the OID would give two rows one blob,
+    so deleting either would unlink it from under the other).
+
+    INSERT ... SELECT keeps the JSONB payload server-side instead of pulling a
+    potentially large setup through the client. Returns None if the source row
+    doesn't exist or belongs to someone else.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO simulations
+                    (user_id, instance_name, instance_description, instance)
+                SELECT user_id,
+                       -- 248 + len(' (copy)') keeps it inside VARCHAR(255)
+                       COALESCE(
+                           %s,
+                           left(COALESCE(instance_name, 'Untitled'), 248) || ' (copy)'
+                       ),
+                       instance_description,
+                       instance
+                FROM simulations
+                WHERE public_id = %s AND user_id = %s
+                RETURNING public_id, instance_name, instance_description,
+                          is_solved, created_at, updated_at;
+                """,
+                (name, public_id, user_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return row
+
+
 def delete_instance(user_id: str, public_id: str) -> bool:
     with get_conn() as conn:
         with conn.cursor() as cur:

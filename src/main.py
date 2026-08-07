@@ -55,6 +55,11 @@ class InstanceCreate(BaseModel):
     description: Optional[str] = None
 
 
+class InstanceClone(BaseModel):
+    # optional override; the API derives "<name> (copy)" when omitted
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+
 class InstanceUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=255)
     description: Optional[str] = None
@@ -199,6 +204,19 @@ async def update_instance(
         name=payload.name,
         description=payload.description,
         instance=payload.instance,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    return row
+
+
+@app.post("/api/instances/{public_id}/clone", tags=["Model"], status_code=201)
+async def clone_instance(
+    public_id: UUID, payload: InstanceClone | None = None, user=Depends(current_user)
+):
+    """Duplicate the setup into a new, unsolved instance. The solution is not copied."""
+    row = db.clone_instance(
+        user["sub"], str(public_id), name=payload.name if payload else None
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Instance not found")
