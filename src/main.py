@@ -17,7 +17,7 @@ import asyncio
 import contextlib
 from datetime import date
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import rasterio
 from fastapi import FastAPI, HTTPException, Response, Depends, UploadFile, File, Form
@@ -38,7 +38,7 @@ from rq.registry import (
 )
 
 from pydantic import BaseModel, Field
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from src.auth import current_user, current_user_from_query, CLIENT_ID
 import src.db as db
@@ -71,6 +71,12 @@ class InstanceUpdate(BaseModel):
 class EnqueueResponse(BaseModel):
     message: str
     job_id: str
+    # Where it actually ran: "cluster" | "hpc" | "slurm". The frontend streams
+    # the same way for all three, but shows which backend picked the job up.
+    target: str = "cluster"
+    # Slurm job id, only present for target="slurm" — useful for `squeue` and
+    # for GET /api/hpc/simulation/{slurm_job_id}/log.
+    slurm_job_id: Optional[str] = None
 
 
 class JobStatusResponse(BaseModel):
@@ -96,10 +102,16 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 REDIS_QUEUE = os.getenv("REDIS_CPU", "jobs:gpu")
 REDIS_QUEUE_CLUSTER_GPU = os.getenv("REDIS_GPU", "jobs:cluster:gpu")
 REDIS_QUEUE_CLUSTER_CPU = os.getenv("REDIS_CPU", "jobs:cluster:cpu")
+# Separate from jobs:gpu on purpose: KEDA's worker-gpu ScaledJob drains that
+# one, so an HPC worker sharing it would race KEDA for the same job. A distinct
+# queue lets a SIF worker (on a compute node, or on a laptop for testing) drain
+# HPC work without any coordination with the in-cluster autoscaler.
+REDIS_QUEUE_HPC = os.getenv("QUEUE_HPC", "jobs:hpc")
 
 redis_conn = Redis.from_url(REDIS_URL)
 q = Queue(REDIS_QUEUE, connection=redis_conn)
 q_cluster_gpu = Queue(REDIS_QUEUE_CLUSTER_GPU, connection=redis_conn)
+q_hpc = Queue(REDIS_QUEUE_HPC, connection=redis_conn)
 
 JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "80600"))
 RESULT_TTL = int(os.getenv("RESULT_TTL", str(60 * 60 * 24)))
@@ -217,12 +229,23 @@ async def get_hpc_probe(job_id: str, log_lines: int = 200, user=Depends(current_
 
 @app.get("/jobs", response_model=JobsByStateResponse, tags=["System"])
 async def get_jobs_by_state():
+    # Both queues, so this stays a whole-system view now that HPC work is
+    # enqueued rather than sbatch'd. Slurm-target jobs still have no RQ record.
+    queues = (q, q_hpc)
     return {
-        "queued": q.get_job_ids(),
-        "started": StartedJobRegistry(queue=q).get_job_ids(),
-        "finished": FinishedJobRegistry(queue=q).get_job_ids(),
-        "failed": FailedJobRegistry(queue=q).get_job_ids(),
-        "scheduled": ScheduledJobRegistry(queue=q).get_job_ids(),
+        "queued": [i for qq in queues for i in qq.get_job_ids()],
+        "started": [
+            i for qq in queues for i in StartedJobRegistry(queue=qq).get_job_ids()
+        ],
+        "finished": [
+            i for qq in queues for i in FinishedJobRegistry(queue=qq).get_job_ids()
+        ],
+        "failed": [
+            i for qq in queues for i in FailedJobRegistry(queue=qq).get_job_ids()
+        ],
+        "scheduled": [
+            i for qq in queues for i in ScheduledJobRegistry(queue=qq).get_job_ids()
+        ],
     }
 
 
@@ -302,19 +325,72 @@ async def delete_instance(public_id: UUID, user=Depends(current_user)):
     response_model=EnqueueResponse,
     tags=["Model"],
 )
-async def submit_simulation(public_id: UUID, user=Depends(current_user)):
+async def submit_simulation(
+    public_id: UUID,
+    target: Literal["cluster", "hpc", "slurm"] = "cluster",
+    user=Depends(current_user),
+):
+    """
+    Solve an instance on one of three backends:
+
+      cluster  RQ on `jobs:gpu`, drained by KEDA-spawned in-cluster workers.
+      hpc      RQ on `jobs:hpc`, drained by a SIF worker — a compute node, or a
+               laptop running services/worker-gpu/run-local-worker.sh. Pull
+               model, so no scheduler access is needed to test it.
+      slurm    Push model: SSH to the login node and sbatch run-simulation.slurm,
+               which runs the SIF once for this instance and exits.
+
+    All three publish progress to the same `sim:events:{job_id}` channel, so the
+    client streams from /api/simulate/{job_id}/stream either way and does not
+    need to know which backend ran it.
+    """
     inst = db.get_instance(user["sub"], str(public_id))
     if inst is None:
         raise HTTPException(status_code=404, detail="Instance not found")
 
-    job = q.enqueue(
+    if target == "slurm":
+        # The stream id is minted here rather than derived from the Slurm id:
+        # the client needs it in this response, before sbatch has assigned one.
+        job_id = str(uuid4())
+        slurm_id = await hpc.submit_simulation(str(public_id), job_id)
+        return {
+            "message": f"Simulation submitted to Slurm (job {slurm_id})",
+            "job_id": job_id,
+            "target": "slurm",
+            "slurm_job_id": slurm_id,
+        }
+
+    # Same task and payload shape for both queues — the only difference is which
+    # queue, and therefore which kind of worker picks it up.
+    queue = q_hpc if target == "hpc" else q
+    job = queue.enqueue(
         "tasks.run_anuga",
         {"public_id": str(public_id), "payload": inst["instance"]},
         job_timeout=JOB_TIMEOUT,
         result_ttl=RESULT_TTL,
         meta={"progress": 0.0, "status_message": "Queued"},
     )
-    return {"message": "Simulation enqueued", "job_id": job.id}
+    return {
+        "message": f"Simulation enqueued on {queue.name}",
+        "job_id": job.id,
+        "target": target,
+    }
+
+
+@app.get("/api/hpc/simulation/{slurm_job_id}/log", tags=["HPC"])
+async def get_hpc_simulation_log(
+    slurm_job_id: str, lines: int = 200, user=Depends(current_user)
+):
+    """Slurm output for an HPC simulation — the diagnostic when SSE goes quiet."""
+    try:
+        state = await hpc.job_state(slurm_job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "slurm_job_id": slurm_job_id,
+        "state": state,
+        "log": await hpc.simulation_log(slurm_job_id, lines=lines),
+    }
 
 
 @app.get("/job-status/{job_id}", response_model=JobStatusResponse, tags=["Model"])
@@ -363,7 +439,15 @@ def _sse(event: str, data: dict) -> str:
 
 @app.get("/api/simulate/{job_id}/stream", tags=["Model"])
 async def stream_job(job_id: str, user=Depends(current_user_from_query)):
-    job = _fetch_job(job_id)  # 404 fast on bad id
+    # A target="slurm" job has no RQ record — Slurm is its scheduler — so a
+    # missing job is not an error here, just a stream with no RQ status to
+    # pre-check. (cluster and hpc jobs are both RQ, on different queues;
+    # Job.fetch is keyed on id, not queue, so it finds either.) Only the pub/sub
+    # channel is common to all three backends, and that is what we relay.
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except NoSuchJobError:
+        job = None
     channel = channel_for(job_id)
 
     pubsub = redis_conn.pubsub(ignore_subscribe_messages=True)
@@ -385,16 +469,19 @@ async def stream_job(job_id: str, user=Depends(current_user_from_query)):
     async def event_stream():
         reader_task = loop.run_in_executor(None, reader)
         try:
-            job.refresh()
-            status = job.get_status()
-            if status == JobStatus.FINISHED:
-                yield _sse("complete", {"job_id": job_id})
-                return
-            if status == JobStatus.FAILED:
-                yield _sse(
-                    "error", {"detail": "Simulation failed", "exc": job.exc_info}
-                )
-                return
+            # Skipped for slurm-target jobs: there is no RQ record to
+            # short-circuit on, so we go straight to relaying the channel.
+            if job is not None:
+                job.refresh()
+                status = job.get_status()
+                if status == JobStatus.FINISHED:
+                    yield _sse("complete", {"job_id": job_id})
+                    return
+                if status == JobStatus.FAILED:
+                    yield _sse(
+                        "error", {"detail": "Simulation failed", "exc": job.exc_info}
+                    )
+                    return
 
             heartbeat = float(os.getenv("SSE_HEARTBEAT", "15"))
 
