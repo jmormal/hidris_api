@@ -4,7 +4,7 @@ import gzip
 from contextlib import contextmanager
 
 import psycopg2
-from psycopg2.extras import RealDictCursor, Json
+from psycopg2.extras import RealDictCursor, Json, execute_values
 from psycopg2.pool import ThreadedConnectionPool
 
 import io
@@ -844,6 +844,262 @@ def load_storm_functions(sql_path: str = "sql/02_functions.sql"):
         conn.commit()
 
 
+# ── Post-simulation KPIs ─────────────────────────────────────────────
+#
+# Computed by a separate worker (worker-kpi) after a solve completes, never
+# inline in the ANUGA solve itself — redefining a KPI must never require
+# re-running the (expensive) simulation. Buildings/land-use are reference
+# data pulled from OSM on demand and cached spatially (osm_coverage), so
+# repeat instances in the same basin don't re-hit the Overpass API.
+
+
+def init_db_kpi():
+    """
+    Create the OSM reference tables (buildings, land-use, fetch-coverage
+    cache) and the kpis results table. Idempotent, safe on every startup.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS osm_buildings (
+                    id            SERIAL PRIMARY KEY,
+                    osm_id        BIGINT NOT NULL UNIQUE,
+                    geom          GEOMETRY(MultiPolygon, 4326) NOT NULL,
+                    building_type TEXT,
+                    amenity       TEXT,
+                    tags          JSONB,
+                    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_osm_buildings_geom "
+                "ON osm_buildings USING GIST (geom);"
+            )
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS osm_landuse (
+                    id            SERIAL PRIMARY KEY,
+                    osm_id        BIGINT NOT NULL UNIQUE,
+                    geom          GEOMETRY(MultiPolygon, 4326) NOT NULL,
+                    landuse_class TEXT NOT NULL,
+                    tags          JSONB,
+                    fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_osm_landuse_geom "
+                "ON osm_landuse USING GIST (geom);"
+            )
+
+            # Which ~grid_deg-sized cells have already been pulled from OSM.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS osm_coverage (
+                    cell_x     INT NOT NULL,
+                    cell_y     INT NOT NULL,
+                    grid_deg   DOUBLE PRECISION NOT NULL DEFAULT 0.05,
+                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (cell_x, cell_y, grid_deg)
+                );
+            """)
+
+            # kpi_version lets a redefined KPI produce a new row without
+            # disturbing history or touching the simulation itself.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS kpis (
+                    id            SERIAL PRIMARY KEY,
+                    simulation_id INT NOT NULL
+                                  REFERENCES simulations(id) ON DELETE CASCADE,
+                    kpi_version   INT NOT NULL,
+                    status        TEXT NOT NULL DEFAULT 'pending',
+                    error_message TEXT,
+                    results       JSONB,
+                    computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (simulation_id, kpi_version)
+                );
+            """)
+        conn.commit()
+
+
+def get_missing_osm_coverage(cells: list[tuple[int, int]], grid_deg: float = 0.05):
+    """Given candidate (cell_x, cell_y) grid cells, return the subset not yet
+    marked as fetched."""
+    if not cells:
+        return []
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT cell_x, cell_y FROM osm_coverage WHERE grid_deg = %s;",
+                (grid_deg,),
+            )
+            covered = {tuple(row) for row in cur.fetchall()}
+    return [c for c in cells if c not in covered]
+
+
+def mark_osm_coverage(cells: list[tuple[int, int]], grid_deg: float = 0.05):
+    if not cells:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                "INSERT INTO osm_coverage (cell_x, cell_y, grid_deg) VALUES %s "
+                "ON CONFLICT (cell_x, cell_y, grid_deg) DO NOTHING;",
+                [(x, y, grid_deg) for x, y in cells],
+            )
+        conn.commit()
+
+
+def upsert_osm_buildings(rows: list[dict]):
+    """rows: [{"osm_id", "wkt", "building_type", "amenity", "tags"}]. A
+    feature can be re-fetched across adjacent cells, so duplicate osm_ids are
+    expected and silently dropped."""
+    if not rows:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO osm_buildings (osm_id, geom, building_type, amenity, tags)
+                VALUES %s
+                ON CONFLICT (osm_id) DO NOTHING;
+                """,
+                [
+                    (
+                        r["osm_id"],
+                        r["wkt"],
+                        r.get("building_type"),
+                        r.get("amenity"),
+                        Json(r.get("tags") or {}),
+                    )
+                    for r in rows
+                ],
+                template="(%s, ST_Multi(ST_SetSRID(ST_GeomFromText(%s), 4326)), %s, %s, %s)",
+            )
+        conn.commit()
+
+
+def upsert_osm_landuse(rows: list[dict]):
+    """rows: [{"osm_id", "wkt", "landuse_class", "tags"}]."""
+    if not rows:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO osm_landuse (osm_id, geom, landuse_class, tags)
+                VALUES %s
+                ON CONFLICT (osm_id) DO NOTHING;
+                """,
+                [
+                    (r["osm_id"], r["wkt"], r["landuse_class"], Json(r.get("tags") or {}))
+                    for r in rows
+                ],
+                template="(%s, ST_Multi(ST_SetSRID(ST_GeomFromText(%s), 4326)), %s, %s)",
+            )
+        conn.commit()
+
+
+def get_osm_buildings_in_bbox(min_lon, min_lat, max_lon, max_lat):
+    """GeoJSON rows for buildings intersecting a WGS84 bbox. `&&` uses the
+    GIST index (bbox overlap) — good enough here since the caller does its
+    own precise intersection against the flood extent afterwards."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT osm_id, ST_AsGeoJSON(geom) AS geojson,
+                       building_type, amenity, tags
+                FROM osm_buildings
+                WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326);
+                """,
+                (min_lon, min_lat, max_lon, max_lat),
+            )
+            return cur.fetchall()
+
+
+def get_osm_landuse_in_bbox(min_lon, min_lat, max_lon, max_lat):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT osm_id, ST_AsGeoJSON(geom) AS geojson, landuse_class, tags
+                FROM osm_landuse
+                WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326);
+                """,
+                (min_lon, min_lat, max_lon, max_lat),
+            )
+            return cur.fetchall()
+
+
+def upsert_kpi_status(public_id: str, kpi_version: int, status: str, error_message=None):
+    """Worker-side. Creates or updates the (simulation, kpi_version) row's
+    status, keyed by public_id like save_solution_bytes — the worker acts on
+    behalf of the owner and never sees user_id."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO kpis (simulation_id, kpi_version, status, error_message)
+                SELECT id, %s, %s, %s FROM simulations WHERE public_id = %s
+                ON CONFLICT (simulation_id, kpi_version)
+                DO UPDATE SET status = EXCLUDED.status,
+                              error_message = EXCLUDED.error_message,
+                              computed_at = now();
+                """,
+                (kpi_version, status, error_message, public_id),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                raise LookupError(f"no simulation with public_id {public_id}")
+        conn.commit()
+
+
+def save_kpi_results(public_id: str, kpi_version: int, results: dict):
+    """Worker-side. Writes the finished KPI payload and flips status to
+    'complete' in one statement."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO kpis (simulation_id, kpi_version, status, results, computed_at)
+                SELECT id, %s, 'complete', %s, now() FROM simulations WHERE public_id = %s
+                ON CONFLICT (simulation_id, kpi_version)
+                DO UPDATE SET status = 'complete', results = EXCLUDED.results,
+                              error_message = NULL, computed_at = now();
+                """,
+                (kpi_version, Json(results), public_id),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                raise LookupError(f"no simulation with public_id {public_id}")
+        conn.commit()
+
+
+def get_latest_kpis(user_id: str, public_id: str):
+    """API-side, ownership-scoped. Returns the newest kpis row (any status)
+    for this instance, or None if none exist / the instance isn't the
+    caller's."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT k.kpi_version, k.status, k.error_message, k.results, k.computed_at
+                FROM kpis k
+                JOIN simulations s ON s.id = k.simulation_id
+                WHERE s.public_id = %s AND s.user_id = %s
+                ORDER BY k.kpi_version DESC
+                LIMIT 1;
+                """,
+                (public_id, user_id),
+            )
+            return cur.fetchone()
+
+
 if __name__ == "__main__":
     init_db()  # your existing simulations table
     init_db_storms()  # storm catalog + raster
+    init_db_kpi()  # OSM reference data + kpis results

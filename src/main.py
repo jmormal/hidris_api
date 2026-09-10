@@ -112,6 +112,17 @@ redis_conn = Redis.from_url(REDIS_URL)
 q = Queue(REDIS_QUEUE, connection=redis_conn)
 q_cluster_gpu = Queue(REDIS_QUEUE_CLUSTER_GPU, connection=redis_conn)
 q_hpc = Queue(REDIS_QUEUE_HPC, connection=redis_conn)
+# Own queue (not jobs:cpu/gpu) so a KPI recompute never races the ANUGA
+# workers for the same queue item, and so KEDA can scale worker-kpi
+# independently of the (much heavier) solve workers.
+REDIS_QUEUE_KPI = os.getenv("QUEUE_KPI", "jobs:kpi")
+q_kpi = Queue(REDIS_QUEUE_KPI, connection=redis_conn)
+# RQ's own default job timeout is 180s — far too short once a basin's
+# buildings/land-use aren't cached yet and worker-kpi has to page through
+# several Overpass calls before it can even start the geometry math. Give it
+# comfortably more room; k8s/keda-kpi.yaml's activeDeadlineSeconds is set
+# above this so RQ's own timeout fires first.
+KPI_JOB_TIMEOUT = int(os.getenv("KPI_JOB_TIMEOUT", "1200"))
 
 JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT", "80600"))
 RESULT_TTL = int(os.getenv("RESULT_TTL", str(60 * 60 * 24)))
@@ -144,6 +155,7 @@ def _startup():
     # Idempotent; ensures the tables exist before the first request.
     db.init_db()
     db.init_storms()
+    db.init_db_kpi()
 
 
 # ---------------------------------------------------------------------------
@@ -652,3 +664,28 @@ async def get_result(public_id: UUID, user=Depends(current_user)):
             "Content-Length": str(size),
         },
     )
+
+
+@app.get("/api/instances/{public_id}/kpis", tags=["Model"])
+async def get_kpis(public_id: UUID, user=Depends(current_user)):
+    row = db.get_latest_kpis(user["sub"], str(public_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="No KPIs computed yet")
+    return row
+
+
+@app.post("/api/instances/{public_id}/kpis/recompute", tags=["Model"], status_code=202)
+async def recompute_kpis(public_id: UUID, user=Depends(current_user)):
+    # Ownership check only — the worker itself acts on public_id alone, same
+    # as /simulate and save_solution_bytes.
+    inst = db.get_instance(user["sub"], str(public_id))
+    if inst is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    if not inst["is_solved"]:
+        raise HTTPException(status_code=409, detail="Instance has no solution yet")
+    q_kpi.enqueue(
+        "tasks.compute_kpis",
+        {"public_id": str(public_id)},
+        job_timeout=KPI_JOB_TIMEOUT,
+    )
+    return {"public_id": str(public_id), "queued": True}
