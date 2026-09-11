@@ -18,6 +18,15 @@ _pool = ThreadedConnectionPool(
     user=os.getenv("PG_USER"),
     password=os.getenv("PG_PASSWORD"),
     port=os.getenv("DB_PORT", "5432"),
+    # lock_timeout, not statement_timeout: it only bites while WAITING for a
+    # lock, so ordinary reads are unaffected however long they run. It exists
+    # for startup, where init_storms() takes ACCESS EXCLUSIVE to ALTER TABLE.
+    # A backend left behind by a cancelled HPC job — stuck in lo_read on
+    # `storms`, writing to a TCP peer that no longer exists — holds that table
+    # for as long as it lives, and every api pod then hangs at "Waiting for
+    # application startup" with no error and no readiness probe ever passing.
+    # Failing fast turns an invisible hang into a crash-loop with a log line.
+    options=os.getenv("PG_OPTIONS", "-c lock_timeout=15s"),
 )
 
 

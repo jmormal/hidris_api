@@ -153,9 +153,23 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 @app.on_event("startup")
 def _startup():
     # Idempotent; ensures the tables exist before the first request.
-    db.init_db()
-    db.init_storms()
-    db.init_db_kpi()
+    #
+    # Bounded by the pool's lock_timeout (see db.py): these take ACCESS
+    # EXCLUSIVE locks and would otherwise queue forever behind a long reader,
+    # hanging the app at "Waiting for application startup" with no error.
+    try:
+        db.init_db()
+        db.init_storms()
+        db.init_db_kpi()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"API: schema init could not take its locks ({exc}). "
+            "Something is holding a lock on these tables — most likely a "
+            "Postgres backend left behind by a cancelled HPC job still inside "
+            "lo_read. Check pg_blocking_pids() and pg_terminate_backend() it.",
+            flush=True,
+        )
+        raise
 
 
 # ---------------------------------------------------------------------------
