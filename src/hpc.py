@@ -75,7 +75,12 @@ def _validate_resources(gpus: int | None, mem_gb: int | None) -> tuple[str, str]
     if gpus is not None:
         if not isinstance(gpus, int) or not 1 <= gpus <= MAX_GPUS:
             raise ValueError(f"gpus must be 1-{MAX_GPUS}, got {gpus!r}")
-        gres_flag = f"--gres=gpu:{gpus} "
+        # CPUs must scale with ranks. run-simulation.slurm hardcodes
+        # --cpus-per-task=4, so asking for 5 GPUs used to give 5 MPI ranks
+        # 4 cores to share — genuine oversubscription during the (CPU-bound)
+        # mesh and partition phases. One core per rank plus headroom for the
+        # host-side RK loop.
+        gres_flag = f"--gres=gpu:{gpus} --cpus-per-task={max(4, gpus + 1)} "
 
     mem_flag = ""
     if mem_gb is not None:
