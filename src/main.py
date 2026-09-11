@@ -20,7 +20,7 @@ from datetime import date
 from uuid import UUID, uuid4
 
 import rasterio
-from fastapi import FastAPI, HTTPException, Response, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Response, Depends, UploadFile, File, Form, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -340,6 +340,17 @@ async def delete_instance(public_id: UUID, user=Depends(current_user)):
 async def submit_simulation(
     public_id: UUID,
     target: Literal["cluster", "hpc", "slurm"] = "cluster",
+    gpus: int | None = Query(
+        None, ge=1, le=8,
+        description="target=slurm only: GPUs to request (--gres=gpu:N). "
+                    "Omit to use the job script's default.",
+    ),
+    mem_gb: int | None = Query(
+        None, ge=4, le=480,
+        description="target=slurm only: memory in GB (--mem). Omit to use the "
+                    "job script's default. Size this for the RESULT, not the "
+                    "solve — see run-simulation.slurm.",
+    ),
     user=Depends(current_user),
 ):
     """
@@ -364,7 +375,13 @@ async def submit_simulation(
         # The stream id is minted here rather than derived from the Slurm id:
         # the client needs it in this response, before sbatch has assigned one.
         job_id = str(uuid4())
-        slurm_id = await hpc.submit_simulation(str(public_id), job_id)
+        try:
+            slurm_id = await hpc.submit_simulation(
+                str(public_id), job_id, gpus=gpus, mem_gb=mem_gb
+            )
+        except ValueError as exc:
+            # A bad gpus/mem_gb is the caller's mistake, not a cluster failure.
+            raise HTTPException(status_code=400, detail=str(exc))
         return {
             "message": f"Simulation submitted to Slurm (job {slurm_id})",
             "job_id": job_id,
