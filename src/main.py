@@ -359,6 +359,12 @@ async def submit_simulation(
         description="target=slurm only: GPUs to request (--gres=gpu:N). "
                     "Omit to use the job script's default.",
     ),
+    nodes: int | None = Query(
+        None, ge=1, le=6,
+        description="target=slurm only: compute nodes. 1 (default) runs the "
+                    "single-node script; >1 switches to the multi-node one, "
+                    "where `gpus` is PER NODE and total ranks = nodes x gpus.",
+    ),
     mem_gb: int | None = Query(
         None, ge=4, le=480,
         description="target=slurm only: memory in GB (--mem). Omit to use the "
@@ -391,7 +397,7 @@ async def submit_simulation(
         job_id = str(uuid4())
         try:
             slurm_id = await hpc.submit_simulation(
-                str(public_id), job_id, gpus=gpus, mem_gb=mem_gb
+                str(public_id), job_id, gpus=gpus, mem_gb=mem_gb, nodes=nodes
             )
         except ValueError as exc:
             # A bad gpus/mem_gb is the caller's mistake, not a cluster failure.

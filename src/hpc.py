@@ -21,6 +21,13 @@ from src.remote import RemoteError, check, run
 CONTAINERS_DIR = "$HOME/containers"
 PROBE_SCRIPT = "run-probe.slurm"  # relative: submitted from CONTAINERS_DIR
 SIM_SCRIPT = "run-simulation.slurm"
+# Separate script, not a flag: the multi-node path launches one container per
+# task with srun --mpi=pmix and gives only rank 0 a tailnet, where the
+# single-node path runs one container that starts mpirun itself inside a network
+# namespace shared by every rank. The two launch models have almost nothing in
+# common, so they stay apart rather than growing conditionals.
+SIM_SCRIPT_MN = "run-simulation-mn.slurm"
+MAX_NODES = 6  # the cluster has six
 
 # Slurm job ids are numeric, optionally with an array-task suffix (12345_7).
 # \Z rather than $: $ also matches before a trailing newline, which would let
@@ -65,7 +72,9 @@ MAX_MEM_GB = 480
 MIN_MEM_GB = 4
 
 
-def _validate_resources(gpus: int | None, mem_gb: int | None) -> tuple[str, str]:
+def _validate_resources(
+    gpus: int | None, mem_gb: int | None, nodes: int | None = None
+) -> tuple[str, str]:
     """Turn optional gpu/memory requests into sbatch flags.
 
     Returns ("", "") when neither is set, so the #SBATCH directives baked into
@@ -81,6 +90,15 @@ def _validate_resources(gpus: int | None, mem_gb: int | None) -> tuple[str, str]
         # mesh and partition phases. One core per rank plus headroom for the
         # host-side RK loop.
         gres_flag = f"--gres=gpu:{gpus} --cpus-per-task={max(4, gpus + 1)} "
+
+    if nodes is not None:
+        if not isinstance(nodes, int) or not 1 <= nodes <= MAX_NODES:
+            raise ValueError(f"nodes must be 1-{MAX_NODES}, got {nodes!r}")
+        if nodes > 1:
+            # gpus is PER NODE here — --gres always is — so one rank per GPU on
+            # each node gives nodes*gpus ranks in total.
+            per_node = gpus or 1
+            gres_flag += f"--nodes={nodes} --ntasks-per-node={per_node} "
 
     mem_flag = ""
     if mem_gb is not None:
@@ -98,6 +116,7 @@ async def submit_simulation(
     stream_job_id: str,
     gpus: int | None = None,
     mem_gb: int | None = None,
+    nodes: int | None = None,
 ) -> str:
     """sbatch one ANUGA simulation, returning the Slurm job id.
 
@@ -118,7 +137,8 @@ async def submit_simulation(
         if not _UUID_RE.match(value):
             raise ValueError(f"{name} is not a UUID: {value!r}")
 
-    gres_flag, mem_flag = _validate_resources(gpus, mem_gb)
+    gres_flag, mem_flag = _validate_resources(gpus, mem_gb, nodes)
+    script = SIM_SCRIPT_MN if (nodes or 1) > 1 else SIM_SCRIPT
 
     # --export=ALL,... keeps the login environment and adds ours on top; the
     # slurm script requires both and fails fast without them.
@@ -126,7 +146,7 @@ async def submit_simulation(
         f"cd {CONTAINERS_DIR} && sbatch --parsable "
         f"{gres_flag}{mem_flag}"
         f"--export=ALL,PUBLIC_ID={public_id},JOB_ID={stream_job_id} "
-        f"{SIM_SCRIPT}",
+        f"{script}",
         timeout=60,
     )
     slurm_id = out.strip().split(";")[0].strip()
